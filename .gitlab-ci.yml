@@ -1,0 +1,136 @@
+stages:
+  - test
+  - build
+  - publish
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+default:
+  image: ruby:3.4
+
+variables:
+  FF_SCRIPT_SECTIONS: "true"
+
+test:gem:
+  stage: test
+  image: ruby:$RUBY_VERSION
+  parallel:
+    matrix:
+      - RUBY_VERSION: ["3.4", "4.0"]
+  before_script:
+    - bundle install
+  script:
+    - bundle exec rake spec
+
+build:gem:
+  stage: build
+  before_script:
+    - export VERSION=$(sed -n 's/.*INSPEC_VERSION = "\([^"]*\)".*/\1/p' lib/kitchen/verifier/inspec_version.rb)
+    - |
+      if [ -z "${VERSION}" ]; then
+        echo "ERROR: could not read VERSION from lib/kitchen/verifier/inspec_version.rb"
+        exit 1
+      fi
+    - echo "Building kitchen-inspec version ${VERSION}"
+  script:
+    - |
+      set -e
+      gem build kitchen-inspec.gemspec 
+    - ls -l *.gem
+  artifacts:
+    name: "kitchen-inspec-${CI_COMMIT_REF_SLUG}"
+    paths:
+      - "*.gem"
+    expire_in: 1 week
+
+publish:gem:stage:
+  stage: publish
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  dependencies:
+    - build:gem
+  before_script:
+    - export VERSION=$(sed -n 's/.*INSPEC_VERSION = "\([^"]*\)".*/\1/p' lib/kitchen/verifier/inspec_version.rb)
+    - |
+      if [ -z "${VERSION}" ]; then
+        echo "ERROR: could not read VERSION from lib/kitchen/verifier/inspec_version.rb"
+        exit 1
+      fi
+    - |
+      mkdir -p $HOME/.gem
+      touch $HOME/.gem/credentials
+      chmod 0600 $HOME/.gem/credentials
+      printf -- "---\n:gemstash_stage: ${GEMSTASH_STAGE_API_KEY}\n" > $HOME/.gem/credentials
+  script:
+    - echo "Pushing kitchen-inspec ${VERSION} to Gemstash Stage server at ${GEMSTASH_STAGE_URL}..."
+    - |
+      set -e
+      HOST="${GEMSTASH_STAGE_URL}/private"
+      KEY="gemstash_stage"
+      GEM_FILE=$(ls *.gem)
+
+      echo "Pushing ${GEM_FILE} to ${HOST}..."
+
+      set +e
+      OUTPUT=$(gem push --verbose --key "${KEY}" --host "${HOST}" "${GEM_FILE}" 2>&1)
+      STATUS=$?
+      set -e
+
+      echo "$OUTPUT"
+
+      if [ $STATUS -ne 0 ]; then
+        if echo "$OUTPUT" | grep -q "500 Internal Server Error"; then
+          echo "NOTICE: Gemstash returned 500 for ${GEM_FILE}, version likely already exists. Skipping..."
+        else
+          echo "ERROR: gem push failed for ${GEM_FILE}."
+          exit 1
+        fi
+      else
+        echo "Push successful: ${GEM_FILE}"
+      fi
+
+publish:gem:prod:
+  stage: publish
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+  dependencies:
+    - build:gem
+  before_script:
+    - |
+      export VERSION=$(sed -n 's/.*INSPEC_VERSION = "\([^"]*\)".*/\1/p' lib/kitchen/verifier/inspec_version.rb)
+      mkdir -p $HOME/.gem
+      touch $HOME/.gem/credentials
+      chmod 0600 $HOME/.gem/credentials
+      printf -- "---\n:gemstash_prod: ${GEMSTASH_PROD_API_KEY}\n" > $HOME/.gem/credentials
+  script:
+    - echo "Pushing kitchen-inspec ${VERSION} to Gemstash Prod server at ${GEMSTASH_PROD_URL}..."
+    - |
+      set -e
+      HOST="${GEMSTASH_PROD_URL}/private"
+      KEY="gemstash_prod"
+      GEM_FILE=$(ls *.gem)
+
+      echo "Pushing ${GEM_FILE} to ${HOST}..."
+
+      set +e
+      OUTPUT=$(gem push --verbose --key "${KEY}" --host "${HOST}" "${GEM_FILE}" 2>&1)
+      STATUS=$?
+      set -e
+
+      echo "$OUTPUT"
+
+      if [ $STATUS -ne 0 ]; then
+        if echo "$OUTPUT" | grep -q "500 Internal Server Error"; then
+          echo "NOTICE: Gemstash returned 500 for ${GEM_FILE}, version likely already exists. Skipping..."
+        else
+          echo "ERROR: gem push failed for ${GEM_FILE}."
+          exit 1
+        fi
+      else
+        echo "Push successful: ${GEM_FILE}"
+      fi
